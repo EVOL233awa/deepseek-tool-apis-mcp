@@ -1,0 +1,51 @@
+{
+  "name": "deepseek-tool-apis-mcp",
+  "version": "1.0.0",
+  "description": "Zero-dependency MCP server for DeepSeek's standalone Search, Fetch, OCR, TTS and ASR tool APIs.",
+  "type": "module",
+  "main": "server.mjs",
+  "bin": {
+    "deepseek-tool-apis-mcp": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "docs",
+    "examples",
+    "tests"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "npm run test:unit && npm run test:protocol && npm run test:e2e",
+    "test:unit": "node tests/unit.mjs ./server.mjs",
+    "test:protocol": "node tests/protocol.mjs ./server.mjs",
+    "test:e2e": "node tests/mock-api.mjs ./server.mjs",
+    "test:live": "node tests/live-smoke.mjs ./server.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "deepseek",
+    "web-search",
+    "web-fetch",
+    "ocr",
+    "tts",
+    "asr",
+    "stdio"
+  ],
+  "license": "MIT",
+  "author": "EVOL233awa",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EVOL233awa/deepseek-tool-apis-mcp.git"
+  },
+  "homepage": "https://github.com/EVOL233awa/deepseek-tool-apis-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/EVOL233awa/deepseek-tool-apis-mcp/issues"
+  }
+}

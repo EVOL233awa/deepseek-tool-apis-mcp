@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "deepseek-tool-apis": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/deepseek-tool-apis-mcp/server.mjs"
+      ],
+      "env": {
+        "DEEPSEEK_API_KEY": "<your-deepseek-api-key>",
+        "DEEPSEEK_ALLOWED_DIRS": "/absolute/allowed/dir"
+      }
+    }
+  }
+}
