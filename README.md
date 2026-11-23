@@ -1,3 +1,5 @@
+[English](README_EN.md) | 中文
+
 # DeepSeek Tool APIs MCP
 
 把 DeepSeek 独立工具接口封装成 MCP 工具，供 AI 客户端调用。

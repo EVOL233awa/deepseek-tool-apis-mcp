@@ -10,6 +10,7 @@
   "files": [
     "server.mjs",
     "README.md",
+    "README_EN.md",
     "CHANGELOG.md",
     "LICENSE",
     "docs",
