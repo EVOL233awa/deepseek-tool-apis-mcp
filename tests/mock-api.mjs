@@ -70,6 +70,39 @@ function fetchResponse(url) {
 }
 
 const server = createServer((req, res) => {
+  // OCR/ASR 是 multipart，不能走下面的 utf8 JSON 解析。
+  if (req.url === "/v1/tools/ocr" || req.url === "/v1/tools/asr") {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks);
+      requests.push({ path: req.url, multipart: body, headers: req.headers });
+      const latin = body.toString("latin1");
+      const name = latin.match(/filename="([^"]+)"/)?.[1] ?? "unknown";
+      const marker = latin.indexOf(`filename="${name}"`);
+      const dataStart = marker < 0 ? -1 : latin.indexOf("\r\n\r\n", marker) + 4;
+      const dataEnd = dataStart > 3 ? latin.lastIndexOf("\r\n--") : -1;
+      const uploaded = dataStart > 3 && dataEnd > dataStart ? body.subarray(dataStart, dataEnd) : Buffer.alloc(0);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/v1/tools/ocr") {
+        res.end(JSON.stringify({
+          page_count: 1,
+          purpose: "text_recognition",
+          pages: [{ index: 0, text: `uploaded:${name}:${uploaded.toString("latin1")}`, finish_reason: "stop" }],
+        }));
+      } else {
+        res.end(JSON.stringify({ text: "mock transcript", duration_ms: 1500 }));
+      }
+    });
+    return;
+  }
+  if (req.url === "/fixture/sample.pdf") {
+    const bytes = Buffer.from("%PDF-mock-fixture", "utf8");
+    requests.push({ path: req.url, body: {}, headers: req.headers });
+    res.writeHead(200, { "Content-Type": "application/pdf", "Content-Length": bytes.length });
+    res.end(bytes);
+    return;
+  }
   let raw = "";
   req.setEncoding("utf8");
   req.on("data", (chunk) => { raw += chunk; });
@@ -279,6 +312,39 @@ ok("批内部分失败仍返回成功结果", !isErr(mixed) && txt(mixed).includ
 
 const beyond = await fetchPages({ urls: ["https://example.com/long"], offset: 999999 });
 ok("offset 越界给提示而非报错", !isErr(beyond) && txt(beyond).includes("超出正文长度"), txt(beyond));
+
+console.log("\n【sources：base64 / URL】");
+const ocrCall = (args) => call("tools/call", { name: "deepseek_ocr", arguments: args });
+const pdfBytes = Buffer.from("%PDF-1.4 mock", "utf8");
+const pdfB64 = pdfBytes.toString("base64");
+const ocrB64 = await ocrCall({ sources: [{ name: "inline.pdf", base64: pdfB64 }] });
+ok("OCR base64 成功", !isErr(ocrB64) && txt(ocrB64).includes("inline.pdf"), txt(ocrB64));
+const ocrUpload = requests.filter((r) => r.path === "/v1/tools/ocr").at(-1);
+ok("multipart 文件名正确", ocrUpload?.multipart?.toString("latin1").includes('filename="inline.pdf"') === true);
+ok("上传字节等于 base64 解码结果", Boolean(ocrUpload?.multipart?.includes(pdfBytes)));
+
+const asrB64 = await call("tools/call", { name: "deepseek_asr", arguments: { sources: [{ name: "clip.wav", base64: Buffer.from("RIFFmockwav").toString("base64") }] } });
+ok("ASR base64 成功", !isErr(asrB64) && txt(asrB64).includes("mock transcript"), txt(asrB64));
+
+const beforeInvalid = requests.filter((r) => r.path === "/v1/tools/ocr").length;
+const badB64 = await ocrCall({ sources: [{ name: "a.pdf", base64: "@@@" }] });
+ok("非法 base64 本地拒绝", isErr(badB64) && txt(badB64).includes("不是合法 Base64"), txt(badB64));
+ok("非法 base64 不产生计费请求", requests.filter((r) => r.path === "/v1/tools/ocr").length === beforeInvalid);
+const noName = await ocrCall({ sources: [{ base64: pdfB64 }] });
+ok("缺 name 拒绝", isErr(noName) && txt(noName).includes("name 必需"), txt(noName));
+const bothSources = await ocrCall({ sources: [{ name: "a.pdf", base64: pdfB64, url: "https://example.com/a.pdf" }] });
+ok("base64 与 url 只能给一个", isErr(bothSources) && txt(bothSources).includes("只能提供"), txt(bothSources));
+
+const privateUrl = await ocrCall({ sources: [{ url: `${base}/fixture/sample.pdf` }] });
+ok("默认拒绝私网 URL", isErr(privateUrl) && txt(privateUrl).includes("私有/环回"), txt(privateUrl));
+ok("拒绝时不下载 fixture", requests.filter((r) => r.path === "/fixture/sample.pdf").length === 0);
+
+const urlServer = startServer({ DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE: "1" });
+await urlServer.call("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "mock", version: "1" } });
+const ocrUrl = await urlServer.call("tools/call", { name: "deepseek_ocr", arguments: { sources: [{ url: `${base}/fixture/sample.pdf` }] } });
+ok("允许内网时 URL 下载并识别成功", !isErr(ocrUrl) && txt(ocrUrl).includes("sample.pdf"), txt(ocrUrl));
+ok("fixture 只下载一次", requests.filter((r) => r.path === "/fixture/sample.pdf").length === 1);
+urlServer.stop();
 
 console.log("\n【TTS 输出路径】");
 const ttsPath = join(tmpdir(), `ds-mcp-tts-${Date.now()}.wav`);

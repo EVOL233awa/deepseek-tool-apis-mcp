@@ -9,7 +9,7 @@ const tmp = join(dirname(fileURLToPath(import.meta.url)), "_server.unit.mjs");
 writeFileSync(
   tmp,
   source.replace(/\nvoid main\(\);\s*$/, "\n") +
-    "\nexport { normalizeUrl, countBilledChars, clampInt, clip, parsePageRange, validateFetchUrl, requireQueries, requireUrls, formatOcrResult, slicePages, retryDelayMs, isInsideDirs, yuan, PRICE, uniqueQueries, parseOriQuestion, parseLocalization, mergeSearchItem, assertNoApiError, createCache, expandHome, parseEnabledTools };\n",
+    "\nexport { normalizeUrl, countBilledChars, clampInt, clip, parsePageRange, validateFetchUrl, requireQueries, requireUrls, formatOcrResult, slicePages, retryDelayMs, isInsideDirs, yuan, PRICE, uniqueQueries, parseOriQuestion, parseLocalization, mergeSearchItem, assertNoApiError, createCache, expandHome, parseEnabledTools, decodeSourceBase64, sourceFileName, isPrivateIp };\n",
 );
 const m = await import(pathToFileURL(tmp).href);
 rmSync(tmp, { force: true });
@@ -206,6 +206,26 @@ ok("未知名称报错并列出可选值",
   m.parseEnabledTools("serch").error?.includes("未知工具") && m.parseEnabledTools("serch").error?.includes("search"));
 ok("只有逗号视为空列表并报错", m.parseEnabledTools(",").error?.includes("未包含任何工具名"));
 eq("合法配置无错误", m.parseEnabledTools("tts").error, null);
+
+console.log("\n【sources 内联/远程文件】");
+eq("纯 base64 解码", m.decodeSourceBase64(Buffer.from("abc", "utf8").toString("base64")).toString("utf8"), "abc");
+eq("data URL base64 解码", m.decodeSourceBase64("data:application/pdf;base64," + Buffer.from("pdf").toString("base64")).toString("utf8"), "pdf");
+throws("非法字符拒绝", () => m.decodeSourceBase64("@@@"), "不是合法 Base64");
+throws("长度非 4 倍数拒绝", () => m.decodeSourceBase64("abc"), "不是合法 Base64");
+eq("name 去掉路径只剩文件名", m.sourceFileName({ name: "../../evil/doc.pdf" }, ""), "doc.pdf");
+eq("url 无 name 时取末段", m.sourceFileName({}, "https://x.com/a%20b.pdf"), "a b.pdf");
+throws("无 name 且 url 无文件名拒绝", () => m.sourceFileName({}, "https://x.com/"), "name 必需");
+ok("私网 IPv4 拒绝", m.isPrivateIp("192.168.1.1") === true);
+ok("环回 IPv4 拒绝", m.isPrivateIp("127.0.0.1") === true);
+ok("链路本地拒绝", m.isPrivateIp("169.254.169.254") === true);
+ok("CGNAT 拒绝", m.isPrivateIp("100.64.0.1") === true);
+ok("文档地址拒绝", m.isPrivateIp("203.0.113.9") === true);
+ok("公网 IPv4 放行", m.isPrivateIp("1.1.1.1") === false);
+ok("IPv6 环回拒绝", m.isPrivateIp("::1") === true);
+ok("IPv6 唯一本地拒绝", m.isPrivateIp("fd00::1") === true);
+ok("IPv6 链路本地拒绝", m.isPrivateIp("fe80::1") === true);
+ok("IPv4-mapped IPv6 私网拒绝", m.isPrivateIp("::ffff:192.168.1.1") === true);
+ok("非法 IP 视为不安全", m.isPrivateIp("garbage") === true);
 
 console.log(`\n结果：${pass} 通过 / ${fails.length} 失败`);
 if (fails.length > 0) {

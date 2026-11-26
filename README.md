@@ -87,6 +87,25 @@
 - 支持 `file` 或 `files`（最多 5 个）；每个文件单独计费，单个失败不影响同批已成功的结果。
 - 单页输出达上限时提示改用 `rich_layout_recognition`，适合工程图、图纸等密集标注页。
 
+### 内联/远程文件（sources）
+
+MCP 的 `tools/call` 只传 JSON，没有标准文件附件。OCR/ASR 的 `sources` 让调用方直接给 Base64 或 URL，server 端解码/下载后以 multipart 上传，不必先把文件放进 server 所在容器。
+
+```jsonc
+// OCR：base64 内联（name 必填，带扩展名）
+{ "sources": [{ "name": "spec.pdf", "base64": "JVBERi0xLjQ..." }] }
+// ASR：URL（未给 name 时从 URL 末段推断）
+{ "sources": [{ "url": "https://example.com/clip.wav" }] }
+// 可与本地路径混用，总数仍受各工具上限约束（OCR 5 个、ASR 1 个）
+{ "file": "C:/docs/a.pdf", "sources": [{ "name": "b.pdf", "base64": "..." }] }
+```
+
+- 每项必须且只能给 `base64` 或 `url` 之一；`base64` 支持 `data:...;base64,` 前缀。
+- 文件类型由扩展名判断：base64 必须给 `name`；URL 可省略，取 URL 末段。
+- `DEEPSEEK_ALLOWED_DIRS` 只约束本地路径；`sources` 内容由 server 自己解码/下载，不走本地路径白名单。
+- URL 默认拒绝私有/环回/链路本地/metadata 地址（含 DNS 解析结果与每一跳重定向），下载限 30 s、最多 3 跳、按工具大小上限流式截断。确实要访问内网地址时设 `DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE=1`。
+- 下载/解码失败在本地报错，不会向 DeepSeek 发送计费请求。
+
 ### TTS / ASR
 
 ```jsonc
@@ -204,7 +223,8 @@ AstrBot、Docker、各类客户端的超时差异见 [`docs/clients.md`](docs/cl
 |---|---|---|
 | `DEEPSEEK_API_KEY` | API Key（必需，只从环境变量读取） | — |
 | `DEEPSEEK_API_BASE` | API 地址 | `https://api.deepseek.com` |
-| `DEEPSEEK_ALLOWED_DIRS` | OCR/ASR 读取与 TTS 写入的白名单；分隔符同 `PATH` | 空（不限制） |
+| `DEEPSEEK_ALLOWED_DIRS` | OCR/ASR 读取与 TTS 写入的白名单；分隔符同 `PATH`；只约束本地路径 | 空（不限制） |
+| `DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE` | 设为 `1` 时允许 `sources[].url` 指向私有/环回地址 | 空（拒绝，防 SSRF） |
 | `DEEPSEEK_AUDIO_DIR` | TTS 默认输出目录 | `~/.deepseek-tool-apis-mcp/tts` |
 | `DEEPSEEK_ENABLED_TOOLS` | 只启用列出的工具（短名 `search`/`fetch`/`ocr`/`tts`/`asr`，逗号分隔）；未知名称启动失败 | 空（全部启用） |
 | `DEEPSEEK_SEARCH_CACHE_TTL_MS` | Search 缓存 TTL；`0` 关闭 | `300000` |
@@ -222,6 +242,7 @@ AstrBot、Docker、各类客户端的超时差异见 [`docs/clients.md`](docs/cl
 - **超时**：Search 30 s、Fetch 60 s、OCR 200 s、ASR 200 s、TTS 20 min。
 - **参数校验**：当批次中任一查询/URL 非法时：整批拒绝，不产生任何计费请求；数值参数越界会被 clamp 到合法范围。
 - **本地文件**：当设置 `DEEPSEEK_ALLOWED_DIRS` 时：OCR/ASR 读取与 TTS 写入必须落在白名单内，且白名单检查先于存在性检查；路径支持 `~/` 展开。
+- **内联/远程文件**：OCR/ASR 的 `sources` 支持 base64/URL，不占用本地文件系统；URL 默认拒绝私网地址，下载限 30 s / 3 跳，大小上限为 OCR 100 MiB、ASR 8 MiB。
 - **工具启停**：当设置 `DEEPSEEK_ENABLED_TOOLS` 时：被禁用的工具不出现在 `tools/list`，直接调用返回错误。用于只读环境禁用 TTS、AstrBot 只开 Search/Fetch 等受限部署。
 - **MCP annotations**：Search/Fetch/OCR/ASR 标记为只读；TTS 标记为可写（会落盘）。
 - **未实现**：MCP 进度通知与取消通知目前不处理；长任务被客户端掐断时，服务端可能已经计费。
@@ -239,9 +260,9 @@ npm test
 
 | 文件 | 内容 | 项数 |
 |---|---|---|
-| `tests/unit.mjs` | URL 归一化、计费字符、缓存/LRU、路径展开、OCR 预算等纯函数 | 98 |
+| `tests/unit.mjs` | URL 归一化、计费字符、缓存/LRU、路径展开、OCR 预算、sources 校验等纯函数 | 116 |
 | `tests/protocol.mjs` | 协议协商、并发乱序、通知、畸形输入、参数校验 | 22 |
-| `tests/mock-api.mjs` | 本地 mock API 的 search/fetch/tts 端到端、缓存、offset 续读 | 68 |
+| `tests/mock-api.mjs` | 本地 mock API 的 search/fetch/tts 与 sources(base64/URL) 端到端、缓存、offset 续读 | 80 |
 
 真实接口冒烟（约 ¥0.01，手动运行）：
 
@@ -254,7 +275,8 @@ CI 在 Node 20 / 22 上只跑零成本套件，不会产生接口费用。
 ## 安全
 
 - API Key 只从 `DEEPSEEK_API_KEY` 环境变量读取，不访问本机其它配置；不出现在日志、错误信息或工具输出中。
-- `DEEPSEEK_ALLOWED_DIRS` 可把 OCR/ASR 的读取和 TTS 的写入限制在指定目录；未设置时不限制。
+- `DEEPSEEK_ALLOWED_DIRS` 可把 OCR/ASR 的读取和 TTS 的写入限制在指定目录；未设置时不限制；它只约束本地路径，不约束 `sources`。
+- `sources[].url` 默认拒绝私有/环回/链路本地/云 metadata 地址，并对每跳重定向重新校验；`DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE=1` 是显式放宽，仅在可信网络内使用。
 - TTS 拒绝覆盖已存在文件，避免模型误写同名路径。
 - 网页正文、OCR 文本、搜索摘要都可能包含恶意指令，调用方应把它们当作数据而非指令。
 

@@ -87,6 +87,25 @@ DeepSeek's standalone tool APIs, exposed as MCP tools.
 - Accepts `file` or `files` (up to 5); each file is billed separately and one failure does not discard successful results in the batch.
 - If a single page hits the output limit, the result suggests `rich_layout_recognition`, which suits engineering drawings and densely annotated pages.
 
+### Inline / remote files (`sources`)
+
+MCP `tools/call` carries JSON only; there is no standard file attachment. OCR/ASR `sources` accepts Base64 or a URL, which the server decodes/downloads and uploads as multipart — callers do not need to place files inside the server container first.
+
+```jsonc
+// OCR: inline base64 (name required, with extension)
+{ "sources": [{ "name": "spec.pdf", "base64": "JVBERi0xLjQ..." }] }
+// ASR: a URL (name optional; inferred from the last URL segment)
+{ "sources": [{ "url": "https://example.com/clip.wav" }] }
+// Can be mixed with local paths; per-tool file limits still apply (OCR 5, ASR 1)
+{ "file": "C:/docs/a.pdf", "sources": [{ "name": "b.pdf", "base64": "..." }] }
+```
+
+- Each item must provide exactly one of `base64` or `url`; `base64` accepts a `data:...;base64,` prefix.
+- The type comes from the file extension: base64 requires `name`; for URLs it can be omitted and is inferred from the URL path.
+- `DEEPSEEK_ALLOWED_DIRS` applies only to local paths; `sources` content is decoded/downloaded by the server and bypasses the local path allowlist.
+- URLs pointing at private/loopback/link-local/metadata addresses are rejected by default (including DNS results and every redirect hop); downloads are capped at 30 s, 3 hops and the per-tool size limit. Set `DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE=1` only when internal addresses are genuinely needed.
+- Decode/download failures are rejected locally and produce no billed API request.
+
 ### TTS / ASR
 
 ```jsonc
@@ -204,7 +223,8 @@ AstrBot, Docker and per-client timeout differences: see [`docs/clients.md`](docs
 |---|---|---|
 | `DEEPSEEK_API_KEY` | API key (required; read from the environment only) | — |
 | `DEEPSEEK_API_BASE` | API base URL | `https://api.deepseek.com` |
-| `DEEPSEEK_ALLOWED_DIRS` | Allowlist for OCR/ASR reads and TTS writes; same separator as `PATH` | empty (unrestricted) |
+| `DEEPSEEK_ALLOWED_DIRS` | Allowlist for OCR/ASR reads and TTS writes; same separator as `PATH`; local paths only | empty (unrestricted) |
+| `DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE` | Set to `1` to allow `sources[].url` to target private/loopback addresses | empty (rejected, anti-SSRF) |
 | `DEEPSEEK_AUDIO_DIR` | Default TTS output directory | `~/.deepseek-tool-apis-mcp/tts` |
 | `DEEPSEEK_ENABLED_TOOLS` | Only expose listed tools (short names `search`/`fetch`/`ocr`/`tts`/`asr`, comma-separated); unknown names abort startup | empty (all enabled) |
 | `DEEPSEEK_SEARCH_CACHE_TTL_MS` | Search cache TTL; `0` disables | `300000` |
@@ -222,6 +242,7 @@ API keys are read only from `DEEPSEEK_API_KEY`; the server does not read credent
 - **Timeouts**: Search 30 s, Fetch 60 s, OCR 200 s, ASR 200 s, TTS 20 min.
 - **Validation**: If any query/URL in a batch is invalid: the whole batch is rejected without any billed request; numeric values are clamped to valid ranges.
 - **Local files**: When `DEEPSEEK_ALLOWED_DIRS` is set: OCR/ASR reads and TTS writes must stay inside the allowlist, and the allowlist check happens before existence checks; `~/` is expanded.
+- **Inline/remote files**: OCR/ASR `sources` accepts base64/URL without touching the local filesystem; URLs to private addresses are rejected by default, downloads are capped at 30 s / 3 hops, with size limits of 100 MiB for OCR and 8 MiB for ASR.
 - **Tool enablement**: When `DEEPSEEK_ENABLED_TOOLS` is set: disabled tools do not appear in `tools/list` and direct calls return an error. Useful for read-only deployments or clients that should only use Search/Fetch.
 - **MCP annotations**: Search/Fetch/OCR/ASR are marked read-only; TTS is marked writable (it writes files).
 - **Not implemented**: MCP progress and cancellation notifications are not handled; if a client aborts a long task, the server may already have been billed.
@@ -239,9 +260,9 @@ Three groups:
 
 | File | Coverage | Cases |
 |---|---|---|
-| `tests/unit.mjs` | URL normalization, billed characters, cache/LRU, path expansion, OCR budget and other pure functions | 98 |
+| `tests/unit.mjs` | URL normalization, billed characters, cache/LRU, path expansion, OCR budget, sources validation and other pure functions | 116 |
 | `tests/protocol.mjs` | Protocol negotiation, concurrent out-of-order responses, notifications, malformed input, argument validation | 22 |
-| `tests/mock-api.mjs` | Local mock end-to-end for search/fetch/tts, caching, offset continuation | 68 |
+| `tests/mock-api.mjs` | Local mock end-to-end for search/fetch/tts and sources (base64/URL), caching, offset continuation | 80 |
 
 Live smoke test (about ¥0.01, run manually):
 
@@ -254,7 +275,8 @@ CI runs only the zero-cost suite on Node 20 and 22, so it incurs no API charges.
 ## Security
 
 - The API key is read only from `DEEPSEEK_API_KEY`; it never appears in logs, error messages or tool output.
-- `DEEPSEEK_ALLOWED_DIRS` restricts OCR/ASR reads and TTS writes to the given directories; unset means unrestricted.
+- `DEEPSEEK_ALLOWED_DIRS` restricts OCR/ASR reads and TTS writes to the given directories; unset means unrestricted; it applies to local paths only, not `sources`.
+- `sources[].url` rejects private/loopback/link-local/cloud-metadata addresses by default and revalidates every redirect hop; `DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE=1` opts out, use only on a trusted network.
 - TTS refuses to overwrite existing files, preventing accidental writes to a path already in use.
 - Page content, OCR text and search summaries may contain malicious instructions; treat them as data, not instructions.
 

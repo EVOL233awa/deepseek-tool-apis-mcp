@@ -5,6 +5,7 @@
 
 import { openAsBlob } from "node:fs";
 import { mkdir, stat, writeFile } from "node:fs/promises";
+import { lookup } from "node:dns/promises";
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { isIP } from "node:net";
@@ -57,6 +58,10 @@ const TTS_TIMEOUT_MS = 1_200_000;
 const TTS_MAX_CHARS = 10_000;
 const ASR_TIMEOUT_MS = 200_000;
 const ASR_MAX_BYTES = 8 * 1024 * 1024;
+// sources[].url 由 server 端下载：默认拒绝私有/环回地址（SSRF），显式开内网才放行。
+const SOURCE_URL_TIMEOUT_MS = 30_000;
+const SOURCE_URL_MAX_REDIRECTS = 3;
+const ALLOW_PRIVATE_SOURCE_URL = process.env.DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE === "1";
 // 音频落盘目录：MCP 内容块只有 text/image，发不出音频，只能给路径。
 const AUDIO_OUTPUT_DIR = process.env.DEEPSEEK_AUDIO_DIR ?? join(homedir(), ".deepseek-tool-apis-mcp", "tts");
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
@@ -493,7 +498,7 @@ async function ocrOne(file, { purpose, perPageChars, range, budget }) {
     const form = new FormData();
     // 官方要求 purpose 出现在 file 之前，且不接受其他字段（否则 400）。
     form.append("purpose", purpose);
-    form.append("file", await openAsBlob(file.resolved, { type: file.mime }), file.name);
+    form.append("file", await file.open(), file.name);
     return { method: "POST", headers: apiHeaders(), body: form };
   };
 
@@ -521,22 +526,13 @@ async function ocrOne(file, { purpose, perPageChars, range, budget }) {
 
 async function runOcr(args) {
   assertApiKey();
-  const requested = Array.isArray(args?.files) && args.files.length > 0 ? args.files : [args?.file];
-  const cleaned = requested.filter((f) => typeof f === "string" && f.trim());
-  if (cleaned.length === 0) throw new Error("file 或 files 必须提供至少一个本地文件绝对路径");
-  if (cleaned.length !== requested.length) {
-    throw new Error(`files 中有 ${requested.length - cleaned.length} 项不是非空字符串`);
-  }
-  if (cleaned.length > OCR_MAX_FILES) {
-    throw new Error(`一次最多识别 ${OCR_MAX_FILES} 个文件（每个都单独计费），收到 ${cleaned.length} 个`);
-  }
   const purpose = args?.purpose === "rich_layout_recognition" ? "rich_layout_recognition" : "text_recognition";
   const perPageChars = clampInt(args?.max_chars, 200, 40_000, 4_000);
   const range = parsePageRange(args?.page_range);
 
-  // 先校验全部文件再上传：任一文件不合法时一个计费请求都不发。
-  const files = [];
-  for (const filePath of cleaned) files.push(await prepareOcrFile(filePath));
+  const files = await collectFiles(args, {
+    kind: "ocr", max: OCR_MAX_FILES, maxBytes: OCR_MAX_BYTES, mimeByExt: OCR_MIME_BY_EXT,
+  });
 
   // 官方允许每账号 15 个并发识别，串行处理 5 个文件会让总耗时逼近 5×180 s。
   // 每个文件分到的输出预算按并发文件数均摊，避免 5×24k 字符一次性灌入上下文。
@@ -598,6 +594,173 @@ async function prepareAsrFile(filePath) {
   const mime = ASR_MIME_BY_EXT[ext];
   if (!mime) throw new Error(`不支持的扩展名 ${ext || "(无)"}；ASR 只接受 16 位 PCM WAV 或 Ogg Opus`);
   return { resolvedPath, name: basename(resolvedPath), mime, size: info.size };
+}
+
+// ---- 内联/远程文件来源 ----
+// MCP 的 tools/call 只传 JSON 参数，没有标准文件附件；sources 让调用方直接给 base64 或 URL，
+// 由 server 解码/下载后以 Blob 上传，调用方不必先把文件放进 server 所在容器。
+const DATA_URL_RE = /^data:([^;,]+)?;base64,(.*)$/is;
+
+function decodeSourceBase64(value) {
+  let encoded = String(value).trim().replace(/\s+/g, "");
+  const dataUrl = encoded.match(DATA_URL_RE);
+  if (dataUrl) encoded = dataUrl[2];
+  if (!encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+    throw new Error("sources[].base64 不是合法 Base64");
+  }
+  const bytes = Buffer.from(encoded, "base64");
+  if (bytes.length === 0) throw new Error("sources[].base64 解码后为空");
+  return bytes;
+}
+
+function sourceFileName(source, fallbackUrl) {
+  let name = typeof source?.name === "string" ? source.name.trim() : "";
+  if (!name && fallbackUrl) {
+    try { name = decodeURIComponent(new URL(fallbackUrl).pathname.split("/").pop() ?? ""); }
+    catch { name = ""; }
+  }
+  if (!name) throw new Error("sources[].name 必需（需带扩展名，用于判断文件类型）");
+  name = basename(name.replace(/\\/g, "/"));
+  if (!name || name === "." || name === "..") throw new Error(`sources[].name 不是合法文件名：${name}`);
+  return name;
+}
+
+function isPrivateIp(address) {
+  const family = isIP(address);
+  if (family === 4) {
+    const [a, b, c] = address.split(".").map(Number);
+    if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 192 && b === 0) return true;
+    if (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) return true;
+    if (a === 203 && b === 0 && c === 113) return true;
+    return false;
+  }
+  if (family === 6) {
+    const lower = address.toLowerCase();
+    if (lower === "::" || lower === "::1") return true;
+    if (lower.startsWith("::ffff:")) return isPrivateIp(lower.slice(7));
+    const first = parseInt(lower.split(":")[0] ?? "0", 16);
+    if ((first & 0xfe00) === 0xfc00) return true; // fc00::/7
+    if ((first & 0xffc0) === 0xfe80) return true; // fe80::/10
+    return false;
+  }
+  return true; // 解析失败视为不安全
+}
+
+async function assertSafeSourceUrl(raw) {
+  const url = new URL(validateFetchUrl(raw));
+  if (ALLOW_PRIVATE_SOURCE_URL) return url;
+  const host = url.hostname.replace(/^\[/, "").replace(/\]$/, "");
+  const addresses = isIP(host) ? [{ address: host }] : await lookup(host, { all: true });
+  if (addresses.length === 0) throw new Error(`source.url 无法解析 host：${host}`);
+  for (const { address } of addresses) {
+    if (isPrivateIp(address)) {
+      throw new Error(`source.url 指向私有/环回地址已拒绝：${address}；如确需访问内网地址，设置 DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE=1`);
+    }
+  }
+  return url;
+}
+
+async function downloadSourceBytes(raw, maxBytes) {
+  let current = raw;
+  for (let hop = 0; hop <= SOURCE_URL_MAX_REDIRECTS; hop += 1) {
+    const url = await assertSafeSourceUrl(current);
+    const response = await fetch(url.href, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(SOURCE_URL_TIMEOUT_MS),
+      headers: { "user-agent": USER_AGENT },
+    });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get("location");
+      if (!location) throw new Error("source.url 重定向缺少 Location");
+      await response.body?.cancel();
+      current = new URL(location, url).href;
+      continue;
+    }
+    if (!response.ok) throw new Error(`source.url 下载失败：HTTP ${response.status}`);
+    const declared = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw new Error(`source.url 下载内容 ${(declared / 1024 / 1024).toFixed(1)} MiB 超过上限 ${(maxBytes / 1024 / 1024).toFixed(0)} MiB`);
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("source.url 返回空响应体");
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error(`source.url 下载内容超过上限 ${(maxBytes / 1024 / 1024).toFixed(0)} MiB`);
+      }
+      chunks.push(value);
+    }
+    if (total === 0) throw new Error("source.url 下载到空文件");
+    return { bytes: Buffer.concat(chunks), finalUrl: url.href };
+  }
+  throw new Error("source.url 重定向次数超过上限");
+}
+
+async function prepareInlineSource(source, { maxBytes, mimeByExt }) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    throw new Error("sources[] 的每一项必须是对象");
+  }
+  const hasBase64 = typeof source.base64 === "string" && source.base64.trim().length > 0;
+  const hasUrl = typeof source.url === "string" && source.url.trim().length > 0;
+  if (hasBase64 === hasUrl) throw new Error("sources[] 必须且只能提供 base64 或 url 之一");
+
+  let bytes;
+  let fallbackUrl = "";
+  if (hasBase64) {
+    bytes = decodeSourceBase64(source.base64);
+  } else {
+    fallbackUrl = source.url.trim();
+    bytes = (await downloadSourceBytes(fallbackUrl, maxBytes)).bytes;
+  }
+  if (bytes.length > maxBytes) {
+    throw new Error(`文件内容 ${(bytes.length / 1024 / 1024).toFixed(1)} MiB 超过上限 ${(maxBytes / 1024 / 1024).toFixed(0)} MiB`);
+  }
+  const name = sourceFileName(source, fallbackUrl);
+  const ext = extname(name).toLowerCase();
+  const mime = mimeByExt[ext];
+  if (!mime) throw new Error(`不支持的扩展名 ${ext || "(无)"}；请把文件命名为支持的扩展名`);
+  return { name, mime, size: bytes.length, open: async () => new Blob([bytes], { type: mime }) };
+}
+
+async function collectFiles(args, { kind, max, maxBytes, mimeByExt }) {
+  const local = kind === "ocr"
+    ? (Array.isArray(args?.files) && args.files.length > 0 ? args.files : [args?.file])
+    : [args?.file];
+  const badLocal = local.filter((item) => item !== undefined && item !== null && !(typeof item === "string" && item.trim()));
+  if (badLocal.length > 0) throw new Error(`file/files 中有 ${badLocal.length} 项不是非空字符串`);
+  const sources = Array.isArray(args?.sources) ? args.sources : [];
+  if (sources.length > max) throw new Error(`sources 最多 ${max} 项，收到 ${sources.length} 项`);
+
+  // 全部来源先校验完再上传：任一项不合法时一个计费请求都不发。
+  const files = [];
+  for (const filePath of local) {
+    if (typeof filePath !== "string" || !filePath.trim()) continue;
+    const base = kind === "ocr"
+      ? await prepareOcrFile(filePath)
+      : await prepareAsrFile(filePath);
+    const path = base.resolved ?? base.resolvedPath;
+    files.push({ ...base, open: () => openAsBlob(path, { type: base.mime }) });
+  }
+  for (const [index, source] of sources.entries()) {
+    try {
+      files.push(await prepareInlineSource(source, { maxBytes, mimeByExt }));
+    } catch (error) {
+      throw new Error(`sources[${index}]：${error.message}`);
+    }
+  }
+  if (files.length === 0) throw new Error(`${kind === "ocr" ? "file/files/sources" : "file/sources"} 必须提供至少一个文件`);
+  if (files.length > max) throw new Error(`一次最多 ${max} 个文件（每个都单独计费），收到 ${files.length} 个`);
+  return files;
 }
 
 // TTS 成功时返回二进制流，不能走 requestWithRetry（它按文本读响应体）。
@@ -698,13 +861,15 @@ async function runTts(args) {
 
 async function runAsr(args) {
   assertApiKey();
-  const file = await prepareAsrFile(args?.file);
+  const file = (await collectFiles(args, {
+    kind: "asr", max: 1, maxBytes: ASR_MAX_BYTES, mimeByExt: ASR_MIME_BY_EXT,
+  }))[0];
 
   const raw = await requestWithRetry(
     "/v1/tools/asr",
     async () => {
       const form = new FormData();
-      form.append("file", await openAsBlob(file.resolvedPath, { type: file.mime }), file.name);
+      form.append("file", await file.open(), file.name);
       return { method: "POST", headers: apiHeaders(), body: form };
     },
     { timeoutMs: ASR_TIMEOUT_MS },
@@ -989,6 +1154,17 @@ async function runFetch(args) {
   return { text: parts.join("\n"), failed: succeeded === 0 };
 }
 
+// sources 项：base64 与 url 二选一；name 带扩展名，base64 必填、url 可省略。
+const SOURCE_ITEM_SCHEMA = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "文件名（带扩展名）。base64 时必填；url 时可省略，从 URL 末段推断。" },
+    base64: { type: "string", description: "文件内容的 Base64（可带 data:...;base64, 前缀）；与 url 二选一。" },
+    url: { type: "string", description: "可下载的 http(s) 文件 URL；与 base64 二选一。默认拒绝私有/环回地址，需内网地址请设 DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE=1。" },
+  },
+  additionalProperties: false,
+};
+
 const TOOLS = [
   {
     name: "deepseek_search",
@@ -1057,13 +1233,19 @@ const TOOLS = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     title: "DeepSeek 语音识别",
     description:
-      "把本地音频文件转写为文字（16 位 PCM WAV 或 Ogg Opus，≤8 MiB、≤120 秒）。不调用对话模型，按音频时长计费（0.78 元/小时，限时 5 折 0.39 元）。语种自动识别，支持 21 种语言。",
+      "把音频转写为文字（16 位 PCM WAV 或 Ogg Opus，≤8 MiB、≤120 秒）。可用本地绝对路径 file，或用 sources 直接传 base64 / URL，无需先把文件放进 server 所在容器。不调用对话模型，按音频时长计费（0.78 元/小时，限时 5 折 0.39 元）。语种自动识别，支持 21 种语言。",
     inputSchema: {
       type: "object",
       properties: {
-        file: { type: "string", description: "音频文件的绝对路径（.wav / .ogg / .opus）。" },
+        file: { type: "string", description: "本地音频文件的绝对路径（.wav / .ogg / .opus）。" },
+        sources: {
+          type: "array",
+          items: SOURCE_ITEM_SCHEMA,
+          minItems: 1,
+          maxItems: 1,
+          description: "内联或远程音频，最多 1 项，可与 file 混用但总数不能超过 1。每项给 base64 或 url 之一。",
+        },
       },
-      required: ["file"],
       additionalProperties: false,
     },
   },
@@ -1072,7 +1254,7 @@ const TOOLS = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     title: "DeepSeek OCR",
     description:
-      "用 DeepSeek 官方 OCR 接口识别本地 PDF/Word/PowerPoint/图片中的文字，按页返回。不调用对话模型，按成功页数计费（1.5 元/1000 页）。text_recognition 丢弃文档中的图、只要文字；rich_layout_recognition 会裁出图表并保留坐标标记（如 <｜ref｜>标题<｜/ref｜><｜box｜>[[52,40,948,96]]<｜/box｜>，坐标按页宽高归一化到 0–1000）。page_range 与 max_chars 都只在客户端生效，整篇仍会识别并按页计费。",
+      "用 DeepSeek 官方 OCR 接口识别 PDF/Word/PowerPoint/图片中的文字，按页返回。可用本地路径 file/files，或用 sources 直接传 base64 / URL，无需先把文件放进 server 所在容器。不调用对话模型，按成功页数计费（1.5 元/1000 页）。text_recognition 丢弃文档中的图、只要文字；rich_layout_recognition 会裁出图表并保留坐标标记（如 <｜ref｜>标题<｜/ref｜><｜box｜>[[52,40,948,96]]<｜/box｜>，坐标按页宽高归一化到 0–1000）。page_range 与 max_chars 都只在客户端生效，整篇仍会识别并按页计费。",
     inputSchema: {
       type: "object",
       properties: {
@@ -1083,6 +1265,13 @@ const TOOLS = [
           minItems: 1,
           maxItems: 5,
           description: "同 file，可一次传多个（最多 5 个）。每个文件单独计费。file 与 files 二选一。",
+        },
+        sources: {
+          type: "array",
+          items: SOURCE_ITEM_SCHEMA,
+          minItems: 1,
+          maxItems: 5,
+          description: "内联或远程文件，最多 5 个，可与 file/files 混用。每项给 base64 或 url 之一；每个文件单独计费。",
         },
         purpose: {
           type: "string",
@@ -1231,7 +1420,8 @@ const HELP_TEXT = `DeepSeek Tool APIs MCP — 把 DeepSeek 官方独立 Tool API
 环境变量:
   DEEPSEEK_API_KEY                 必需；只从环境变量读取
   DEEPSEEK_API_BASE                默认 https://api.deepseek.com
-  DEEPSEEK_ALLOWED_DIRS            OCR/ASR 读取与 TTS 写入的本地目录白名单
+  DEEPSEEK_ALLOWED_DIRS            OCR/ASR 读取与 TTS 写入的本地目录白名单（只约束本地路径，不约束 sources）
+  DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE  设为 1 时允许 sources[].url 指向私有/环回地址（默认拒绝，防 SSRF）
   DEEPSEEK_AUDIO_DIR               TTS 默认输出目录
   DEEPSEEK_ENABLED_TOOLS           启用的工具，逗号分隔（search,fetch,ocr,tts,asr）；默认全部
   DEEPSEEK_SEARCH_CACHE_TTL_MS     Search 缓存 TTL，默认 300000；0 关闭
@@ -1250,6 +1440,7 @@ function checkReport() {
     `output_budget: ${MAX_OUTPUT_CHARS} chars`,
     `enabled_tools: ${[...ENABLED_TOOLS.names].join(",")}`,
     `allowed_dirs: ${ALLOWED_DIRS.length > 0 ? ALLOWED_DIRS.join(delimiter) : "(未限制)"}`,
+    `source_url_allow_private: ${ALLOW_PRIVATE_SOURCE_URL ? "是" : "否"}`,
     `audio_dir: ${AUDIO_OUTPUT_DIR}`,
   ].join("\n");
 }
