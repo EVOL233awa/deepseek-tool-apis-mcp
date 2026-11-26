@@ -2,6 +2,18 @@
 
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/2.0.0/) 与 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- `deepseek_ocr` / `deepseek_asr` 新增 `sources`：每项给 `base64` 或 `url`，server 端解码/下载后以 Blob 上传；调用方无需先把文件放进 server 所在容器。可与本地 `file`/`files` 混用，仍受各工具文件数上限约束（OCR 5、ASR 1）。
+- 配置项 `DEEPSEEK_SOURCE_URL_ALLOW_PRIVATE=1`：显式允许 `sources[].url` 指向私有/环回地址。
+
+### Security
+
+- `sources[].url` 默认拒绝私有/环回/链路本地/metadata 地址（含 DNS 解析结果与每一跳重定向），下载限 30 s / 3 跳 / 工具大小上限，防止 SSRF 与超大响应。
+- 非法 base64、缺文件名、大小越界在本地拒绝，不产生计费请求。
+
 ## [1.0.0] - 2026-11-23
 
 首个公开版本。
